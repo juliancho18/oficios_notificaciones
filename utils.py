@@ -2068,3 +2068,208 @@ Utils.definir_responsable_pelota_caliente_seguimiento = _utils_definir_responsab
 Utils.construir_reporte_seguimiento_sae_sidcar = _utils_construir_reporte_seguimiento_sae_sidcar
 Utils.construir_resumen_seguimiento_sae_sidcar = _utils_construir_resumen_seguimiento_sae_sidcar
 Utils.exportar_reporte_seguimiento_sae_sidcar = _utils_exportar_reporte_seguimiento_sae_sidcar
+
+
+# ============================================================
+# PARCHE ADITIVO 2026-03-26 B
+# Fechas de inicio / fin + días transcurridos + estado de vencimiento
+# Mantiene todo lo existente y solo sobrescribe la lógica final
+# del seguimiento SAE + SIDCAR.
+# ============================================================
+
+def _utils_calcular_fecha_inicio_expediente(self, row: pd.Series):
+    """
+    Fecha inicial del expediente por abogado.
+    Prioridad:
+    1) fecha_preradicado
+    2) fecha_ultimo_documento_sae
+    """
+    fecha_pre = pd.to_datetime(row.get("fecha_preradicado"), errors="coerce")
+    fecha_sae = pd.to_datetime(row.get("fecha_ultimo_documento_sae"), errors="coerce")
+
+    if pd.notna(fecha_pre):
+        return fecha_pre
+    if pd.notna(fecha_sae):
+        return fecha_sae
+    return pd.NaT
+
+
+def _utils_calcular_fecha_fin_expediente(self, row: pd.Series):
+    """
+    Fecha final del expediente.
+    Regla:
+    - si está finalizado / tiene radicado -> usar fecha_radicado
+    - si por alguna razón está finalizado pero sin fecha_radicado, usar
+      fecha_ultimo_documento_sae como respaldo operativo
+    """
+    estado = str(row.get("estado_pelota_caliente", "")).strip().lower()
+    tiene_radicado = bool(row.get("tiene_radicado", False))
+
+    fecha_rad = pd.to_datetime(row.get("fecha_radicado"), errors="coerce")
+    fecha_sae = pd.to_datetime(row.get("fecha_ultimo_documento_sae"), errors="coerce")
+
+    if tiene_radicado or estado == "firmado/finalizado":
+        if pd.notna(fecha_rad):
+            return fecha_rad
+        if pd.notna(fecha_sae):
+            return fecha_sae
+
+    return pd.NaT
+
+
+def _utils_calcular_dias_transcurridos_expediente(self, row: pd.Series):
+    fecha_inicio = pd.to_datetime(row.get("fecha_inicio_expediente"), errors="coerce")
+    fecha_fin = pd.to_datetime(row.get("fecha_fin_expediente"), errors="coerce")
+
+    if pd.isna(fecha_inicio):
+        return None
+
+    fecha_corte = fecha_fin if pd.notna(fecha_fin) else pd.Timestamp.today().normalize()
+    return int((fecha_corte.normalize() - fecha_inicio.normalize()).days)
+
+
+def _utils_clasificar_estado_vencimiento(self, row: pd.Series) -> str:
+    """
+    Reglas:
+    - Finalizado -> si ya terminó
+    - Vencido -> > 30 días corridos
+    - Por vencer -> desde 25 hasta 30 días corridos
+    - En término -> < 25 días corridos
+    - Sin fecha inicial -> no se puede medir
+    """
+    fecha_inicio = pd.to_datetime(row.get("fecha_inicio_expediente"), errors="coerce")
+    fecha_fin = pd.to_datetime(row.get("fecha_fin_expediente"), errors="coerce")
+    dias = row.get("dias_transcurridos_expediente")
+
+    if pd.isna(fecha_inicio):
+        return "Sin fecha inicial"
+
+    if pd.notna(fecha_fin):
+        return "Finalizado"
+
+    if dias is None or pd.isna(dias):
+        return "Sin fecha inicial"
+
+    if dias > 30:
+        return "Vencido"
+
+    if 25 <= int(dias) <= 30:
+        return "Por vencer"
+
+    return "En término"
+
+
+def _utils_construir_reporte_seguimiento_sae_sidcar_v2(self, df_documentos_elaborados: pd.DataFrame, df_preradicados: pd.DataFrame, df_radicados: pd.DataFrame, nombres_objetivo: list) -> pd.DataFrame:
+    df_sae = _utils_preparar_documentos_elaborados_seguimiento(self, df_documentos_elaborados, nombres_objetivo)
+    df_sidcar = _utils_consolidar_sidcar_seguimiento(self, df_preradicados, df_radicados, nombres_objetivo)
+
+    # OUTER MERGE REAL: conserva lo que exista en cualquiera de las bases.
+    df_final = df_sae.merge(df_sidcar, on=["expediente", "nombre_persona"], how="outer")
+
+    defaults = {
+        "funcionario_sae": "", "etapa_sae": "", "actividad_sae": "", "ultimo_documento_tipo_sae": "",
+        "ultimo_documento_descripcion_sae": "", "fecha_ultimo_documento_sae": pd.NaT,
+        "numero_ultimo_documento_sae": "", "firmado_por_sae": "", "en_sae": False,
+        "nombre_base_preradicado": "", "tiene_preradicado": False, "numero_preradicado": "",
+        "tipo_documento_preradicado": "", "estado_preradicado": "", "fecha_preradicado": pd.NaT,
+        "asunto_preradicado": "", "revisor_pre": "", "en_preradicados": False,
+        "nombre_base_radicado": "", "tiene_radicado": False, "numero_radicado": "",
+        "tipo_documento_radicado": "", "estado_radicado": "", "fecha_radicado": pd.NaT,
+        "asunto_radicado": "", "preradicado_relacionado": "", "revisor_rad": "", "en_radicados": False,
+    }
+    for col, default in defaults.items():
+        if col not in df_final.columns:
+            df_final[col] = default
+        else:
+            try:
+                df_final[col] = df_final[col].fillna(default)
+            except Exception:
+                pass
+
+    df_final["funcionario_sae"] = df_final.apply(
+        lambda r: r["funcionario_sae"] if str(r.get("funcionario_sae", "")).strip() else str(r.get("nombre_persona", "")).strip(),
+        axis=1,
+    )
+
+    df_final["revisor_asociado"] = df_final.apply(
+        lambda r: str(r.get("revisor_rad", "")).strip() or str(r.get("revisor_pre", "")).strip() or str(r.get("firmado_por_sae", "")).strip(),
+        axis=1,
+    )
+
+    df_final["fuentes_presentes"] = df_final.apply(
+        lambda r: " | ".join([
+            fuente for fuente, ok in [
+                ("SAE", bool(r.get("en_sae", False))),
+                ("PRERADICADOS", bool(r.get("en_preradicados", False))),
+                ("RADICADOS", bool(r.get("en_radicados", False))),
+            ] if ok
+        ]),
+        axis=1,
+    )
+
+    df_final["estado_pelota_caliente"] = df_final.apply(
+        lambda row: _utils_clasificar_estado_pelota_caliente_seguimiento(self, row),
+        axis=1
+    )
+
+    df_final["responsable_pelota_caliente"] = df_final.apply(
+        lambda row: _utils_definir_responsable_pelota_caliente_seguimiento(self, row),
+        axis=1
+    )
+
+    # Nuevas fechas y estados de control
+    df_final["fecha_inicio_expediente"] = df_final.apply(
+        lambda row: _utils_calcular_fecha_inicio_expediente(self, row),
+        axis=1
+    )
+
+    df_final["fecha_fin_expediente"] = df_final.apply(
+        lambda row: _utils_calcular_fecha_fin_expediente(self, row),
+        axis=1
+    )
+
+    df_final["dias_transcurridos_expediente"] = df_final.apply(
+        lambda row: _utils_calcular_dias_transcurridos_expediente(self, row),
+        axis=1
+    )
+
+    df_final["estado_vencimiento"] = df_final.apply(
+        lambda row: _utils_clasificar_estado_vencimiento(self, row),
+        axis=1
+    )
+
+    columnas_orden = [
+        "expediente", "nombre_persona", "funcionario_sae",
+        "fuentes_presentes", "en_sae", "en_preradicados", "en_radicados",
+        "etapa_sae", "actividad_sae", "ultimo_documento_tipo_sae", "ultimo_documento_descripcion_sae",
+        "fecha_ultimo_documento_sae", "numero_ultimo_documento_sae", "firmado_por_sae",
+        "tiene_preradicado", "numero_preradicado", "tipo_documento_preradicado", "estado_preradicado",
+        "fecha_preradicado", "asunto_preradicado", "revisor_pre",
+        "tiene_radicado", "numero_radicado", "tipo_documento_radicado", "estado_radicado",
+        "fecha_radicado", "asunto_radicado", "preradicado_relacionado", "revisor_rad",
+        "fecha_inicio_expediente", "fecha_fin_expediente", "dias_transcurridos_expediente", "estado_vencimiento",
+        "estado_pelota_caliente", "revisor_asociado", "responsable_pelota_caliente",
+    ]
+
+    for c in columnas_orden:
+        if c not in df_final.columns:
+            df_final[c] = ""
+
+    df_final = df_final[columnas_orden].copy()
+    for c in ["fecha_ultimo_documento_sae", "fecha_preradicado", "fecha_radicado", "fecha_inicio_expediente", "fecha_fin_expediente"]:
+        df_final[c] = pd.to_datetime(df_final[c], errors="coerce")
+
+    df_final = df_final.sort_values(
+        by=["nombre_persona", "estado_vencimiento", "estado_pelota_caliente", "expediente"],
+        ascending=[True, True, True, True],
+    ).reset_index(drop=True)
+
+    return df_final
+
+
+# Asignación explícita de métodos parcheados sobre Utils
+Utils.calcular_fecha_inicio_expediente = _utils_calcular_fecha_inicio_expediente
+Utils.calcular_fecha_fin_expediente = _utils_calcular_fecha_fin_expediente
+Utils.calcular_dias_transcurridos_expediente = _utils_calcular_dias_transcurridos_expediente
+Utils.clasificar_estado_vencimiento = _utils_clasificar_estado_vencimiento
+Utils.construir_reporte_seguimiento_sae_sidcar = _utils_construir_reporte_seguimiento_sae_sidcar_v2
