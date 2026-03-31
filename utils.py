@@ -2267,6 +2267,101 @@ def _utils_construir_reporte_seguimiento_sae_sidcar_v2(self, df_documentos_elabo
     return df_final
 
 
+# ============================================================
+# DASHBOARD - PREPARACIÓN BASES LIMPIAS
+# NO REEMPLAZA NADA EXISTENTE
+# ============================================================
+
+def _utils_preparar_preradicados_dashboard(
+    self,
+    df_preradicados: pd.DataFrame,
+    elaboradores: list,
+    revisores: list
+) -> pd.DataFrame:
+
+    df = self.normalizar_encabezados_sidcar(df_preradicados.copy())
+
+    col_estado = find_col(df, ["Estado"])
+    col_persona = find_col(df, ["Usuario", "Responsable", "Elaboró", "Elaboro"])
+    col_fecha = find_col(df, ["Fecha", "Fecha Creacion", "Fecha de Creación"])
+    col_asunto = find_col(df, ["Asunto", "Descripción", "Descripcion"])
+    col_numero = find_col(df, ["Número", "Numero", "Pre-Radicado"])
+
+    if col_persona is None:
+        col_persona = self.detectar_columna_persona_por_contenido(df, elaboradores)
+
+    df["persona"] = df[col_persona].astype(str).apply(self.normalizar_nombre_persona)
+    df = df[df["persona"].isin([self.normalizar_nombre_persona(x) for x in elaboradores])].copy()
+
+    df["estado"] = df[col_estado].astype(str).str.lower()
+    df["fecha"] = pd.to_datetime(df[col_fecha], errors="coerce")
+    df["asunto"] = df[col_asunto].astype(str) if col_asunto else ""
+    df["numero"] = df[col_numero].astype(str) if col_numero else ""
+
+    # CLASIFICACIÓN
+    def clasificar(row):
+        txt = f"{row['estado']} {row['asunto']}".lower()
+
+        if "devuelto" in txt:
+            return "Devuelto"
+
+        if "revision" in txt or "aprobado" in txt:
+            return "En revisión"
+
+        return "Elaborado"
+
+    df["estado_proceso"] = df.apply(clasificar, axis=1)
+
+    return df[[
+        "persona",
+        "numero",
+        "estado",
+        "estado_proceso",
+        "fecha",
+        "asunto"
+    ]]
+
+
+def _utils_preparar_radicados_dashboard(
+    self,
+    df_radicados: pd.DataFrame,
+    elaboradores: list,
+    revisores: list
+) -> pd.DataFrame:
+
+    df = self.normalizar_encabezados_sidcar(df_radicados.copy())
+
+    col_persona = find_col(df, ["Elaboró", "Elaboro", "Responsable"])
+    col_radicado = find_col(df, ["Radicado", "# Radicado"])
+    col_fecha = find_col(df, ["Fecha"])
+    col_asunto = find_col(df, ["Asunto", "Descripción"])
+
+    if col_persona is None:
+        col_persona = self.detectar_columna_persona_por_contenido(df, elaboradores)
+
+    df["persona"] = df[col_persona].astype(str).apply(self.normalizar_nombre_persona)
+    df = df[df["persona"].isin([self.normalizar_nombre_persona(x) for x in elaboradores])].copy()
+
+    df["radicado"] = df[col_radicado].astype(str) if col_radicado else ""
+    df["fecha"] = pd.to_datetime(df[col_fecha], errors="coerce")
+    df["asunto"] = df[col_asunto].astype(str) if col_asunto else ""
+
+    df["estado_proceso"] = "Firmado"
+
+    return df[[
+        "persona",
+        "radicado",
+        "estado_proceso",
+        "fecha",
+        "asunto"
+    ]]
+
+
+# ASIGNAR A LA CLASE
+Utils.preparar_preradicados_dashboard = _utils_preparar_preradicados_dashboard
+Utils.preparar_radicados_dashboard = _utils_preparar_radicados_dashboard
+
+
 # Asignación explícita de métodos parcheados sobre Utils
 Utils.calcular_fecha_inicio_expediente = _utils_calcular_fecha_inicio_expediente
 Utils.calcular_fecha_fin_expediente = _utils_calcular_fecha_fin_expediente
