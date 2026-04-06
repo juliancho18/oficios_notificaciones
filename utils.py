@@ -2368,3 +2368,496 @@ Utils.calcular_fecha_fin_expediente = _utils_calcular_fecha_fin_expediente
 Utils.calcular_dias_transcurridos_expediente = _utils_calcular_dias_transcurridos_expediente
 Utils.clasificar_estado_vencimiento = _utils_clasificar_estado_vencimiento
 Utils.construir_reporte_seguimiento_sae_sidcar = _utils_construir_reporte_seguimiento_sae_sidcar_v2
+
+
+
+
+# ============================================================
+# PARCHE ADITIVO 2026-04-02
+# SEGUIMIENTO SAE + SIDCAR - GRUPO A / GRUPO B
+# No reemplaza lógica previa. Solo agrega nuevas funciones
+# para el análisis solicitado sobre:
+# - Radicados (Grupo A)
+# - Actividades actuales + Preradicados (Grupo B)
+# - Exportación final a un solo Excel con 3 hojas
+# ============================================================
+
+def _ga_norm_persona(self, nombre: str) -> str:
+    return self.normalizar_nombre_persona(
+        re.sub(r"\s*\(.*?\)\s*", "", "" if nombre is None else str(nombre))
+    )
+
+
+def _ga_lista_norm(self, nombres: list) -> list:
+    return [self._ga_norm_persona(x) for x in nombres]
+
+
+def _ga_extraer_expediente_general(self, texto, fallback_clean: bool = False) -> str:
+    if texto is None or (isinstance(texto, float) and pd.isna(texto)):
+        return ""
+    txt = str(texto).strip()
+    if not txt:
+        return ""
+
+    # Prioridad: patrones explícitos tipo "Expediente 12345"
+    patrones = [
+        r"(?i)expediente\s*[:#\-–]?\s*([A-Za-z0-9\-\/]{3,})",
+        r"(?i)exp\.?\s*[:#\-–]?\s*([A-Za-z0-9\-\/]{3,})",
+    ]
+    for patron in patrones:
+        m = re.search(patron, txt)
+        if m:
+            return self.limpiar_expediente(m.group(1))
+
+    # Fallback opcional: usar el valor completo solo cuando se indique de forma explícita
+    if fallback_clean:
+        return self.limpiar_expediente(txt)
+
+    return ""
+
+
+def _ga_clasificar_subgrupo_asunto(self, asunto: str) -> str:
+    txt = self.quitar_tildes("" if asunto is None else str(asunto)).lower()
+    txt = " ".join(txt.split())
+
+    tiene_expediente = "expediente" in txt or bool(re.search(r"\b\d{4,}\b", txt))
+    if not tiene_expediente:
+        return "descartar"
+
+    claves_notificacion = [
+        "notificacion",
+        "notificar",
+        "aviso",
+        "citacion",
+        "comunicacion",
+        "correo electronico",
+        "correo electrónico",
+        "edicto",
+    ]
+    if any(k in txt for k in claves_notificacion):
+        return "impulso_notificacion"
+
+    return "gestion"
+
+
+def _ga_clasificar_tipo_tramite(self, valor: str) -> str:
+    txt = self.quitar_tildes("" if valor is None else str(valor)).lower()
+    if "sancion" in txt:
+        return "Sancionatorio"
+    if "permis" in txt:
+        return "Permisivo"
+    return "No identificado"
+
+
+def _ga_estado_detalle(self, estado: str, comentarios: str = "", remite_es_abogado: bool = False) -> str:
+    texto = self.quitar_tildes(f"{estado} {comentarios}").lower()
+    texto = " ".join(texto.split())
+
+    if "devuelto" in texto and "director" in texto:
+        return "Devuelto por el director"
+
+    if "devuelto" in texto:
+        if remite_es_abogado:
+            return "Devuelto por el revisor"
+        return "Devuelto por el director"
+
+    if "aprob" in texto:
+        return "Aprobado por el revisor"
+
+    if "enviado para aprobacion" in texto or "enviado para aprobacion" in texto:
+        return "Enviado para revisión abogado"
+
+    if "enviado para revision" in texto or "enviado para revision" in texto:
+        return "Enviado para revisión abogado"
+
+    return "Iniciado por abogado"
+
+
+def _ga_estado_macro(self, row: pd.Series) -> str:
+    if bool(row.get("tiene_radicado", False)):
+        return "Radicado"
+
+    detalle = str(row.get("estado_detalle", "")).strip()
+    if detalle:
+        return detalle
+
+    if not bool(row.get("tiene_preradicado", False)):
+        return "Sin iniciar"
+
+    return "Iniciado por abogado"
+
+
+def _ga_vencimiento(self, dias) -> str:
+    if dias is None or pd.isna(dias):
+        return "Sin dato"
+
+    dias = int(dias)
+    if dias > 30:
+        return "Vencido"
+    if 25 <= dias <= 30:
+        return "Por vencer"
+    return "A tiempo"
+
+
+def _ga_preparar_radicados_grupo_a(self, df_radicados: pd.DataFrame, abogados: list) -> pd.DataFrame:
+    df = self.normalizar_encabezados_sidcar(df_radicados.copy())
+
+    col_elaboro = find_col(df, ["Elaboró", "Elaboro"])
+    col_asunto = find_col(df, ["Asunto"])
+    col_expediente = find_col(df, ["Info SAE Expediente", "Expediente"])
+    col_tipo_tramite = find_col(df, ["Proceso", "Tipo Asunto", "Tramite"])
+    col_radicado = find_col(df, ["# Radicado", "Radicado"])
+    col_fecha = find_col(df, ["F Radicado", "Fecha"])
+    col_estado = find_col(df, ["Estado"])
+
+    faltantes = {
+        "elaboro": col_elaboro,
+        "asunto": col_asunto,
+        "radicado": col_radicado,
+    }
+    faltan = [k for k, v in faltantes.items() if v is None]
+    if faltan:
+        raise KeyError(f"❌ En RADICADOS faltan columnas críticas para Grupo A: {faltan}. Columnas: {list(df.columns)}")
+
+    abogados_norm = self._ga_lista_norm(abogados)
+
+    df["abogado"] = df[col_elaboro].astype(str).apply(self._ga_norm_persona)
+    df = df[df["abogado"].isin(abogados_norm)].copy()
+
+    df["expediente"] = ""
+    if col_expediente:
+        df["expediente"] = df[col_expediente].apply(self._ga_extraer_expediente_general)
+    if col_asunto:
+        mask = df["expediente"].eq("")
+        df.loc[mask, "expediente"] = df.loc[mask, col_asunto].apply(self._ga_extraer_expediente_general)
+
+    df["subgrupo"] = df[col_asunto].apply(self._ga_clasificar_subgrupo_asunto) if col_asunto else "descartar"
+    df = df[df["subgrupo"].isin(["impulso_notificacion", "gestion"])].copy()
+
+    df["tipo_tramite_macro"] = df[col_tipo_tramite].apply(self._ga_clasificar_tipo_tramite) if col_tipo_tramite else "No identificado"
+    df["radicado"] = df[col_radicado].astype(str).str.strip()
+    df["fecha_radicado"] = pd.to_datetime(df[col_fecha], errors="coerce") if col_fecha else pd.NaT
+    df["estado_radicado"] = df[col_estado].astype(str).str.strip() if col_estado else ""
+
+    salida = df[[
+        "abogado",
+        "expediente",
+        "tipo_tramite_macro",
+        "subgrupo",
+        "radicado",
+        "fecha_radicado",
+        "estado_radicado",
+    ]].copy()
+
+    salida = salida[salida["expediente"].astype(str).str.strip() != ""].copy()
+    salida = salida.sort_values(["abogado", "fecha_radicado", "expediente"], ascending=[True, False, True]).reset_index(drop=True)
+    return salida
+
+
+def _ga_preparar_preradicados_base(self, df_preradicados: pd.DataFrame, abogados: list) -> pd.DataFrame:
+    df = self.normalizar_encabezados_sidcar(df_preradicados.copy())
+
+    col_numero = find_col(df, ["Número", "Numero", "Pre-Radicado", "Pre Radicado"])
+    col_estado = find_col(df, ["Estado"])
+    col_usuario = find_col(df, ["Usuario", "Responsable", "Elaboró", "Elaboro"])
+    col_asunto = find_col(df, ["Asunto"])
+    col_fecha = find_col(df, ["Información de Creación Fecha", "Fecha"])
+
+    faltantes = {"numero": col_numero, "usuario": col_usuario, "asunto": col_asunto}
+    faltan = [k for k, v in faltantes.items() if v is None]
+    if faltan:
+        raise KeyError(f"❌ En PRERADICADOS faltan columnas críticas para Grupo B: {faltan}. Columnas: {list(df.columns)}")
+
+    abogados_norm = self._ga_lista_norm(abogados)
+    df["abogado"] = df[col_usuario].astype(str).apply(self._ga_norm_persona)
+    df = df[df["abogado"].isin(abogados_norm)].copy()
+
+    df["expediente"] = df[col_asunto].apply(self._ga_extraer_expediente_general)
+    df["subgrupo"] = df[col_asunto].apply(self._ga_clasificar_subgrupo_asunto)
+    df = df[df["subgrupo"].isin(["impulso_notificacion", "gestion"])].copy()
+
+    df["preradicado"] = df[col_numero].astype(str).str.strip()
+    df["estado_preradicado"] = df[col_estado].astype(str).str.strip() if col_estado else ""
+    df["fecha_preradicado"] = pd.to_datetime(df[col_fecha], errors="coerce") if col_fecha else pd.NaT
+    df["asunto_preradicado"] = df[col_asunto].astype(str).str.strip()
+
+    df = df[df["expediente"].astype(str).str.strip() != ""].copy()
+
+    agg = df.groupby(["expediente", "abogado"], as_index=False).agg(
+        preradicado=("preradicado", self._join_unique_seguimiento),
+        estado_preradicado=("estado_preradicado", self._join_unique_seguimiento),
+        fecha_preradicado=("fecha_preradicado", "max"),
+        asunto_preradicado=("asunto_preradicado", "last"),
+        subgrupo=("subgrupo", "last"),
+        tiene_preradicado=("preradicado", lambda s: any(str(x).strip() != "" for x in s if not pd.isna(x))),
+    )
+    return agg
+
+
+def _ga_preparar_actividades_actuales_base(self, df_actividades: pd.DataFrame, abogados: list) -> pd.DataFrame:
+    df = self.normalizar_encabezados_sidcar(df_actividades.copy())
+
+    col_exp = find_col(df, ["Expediente Número", "Expediente"])
+    col_tipo = find_col(df, ["Tipo de Trámite", "Tipo de Tramite"])
+    col_regional = find_col(df, ["Regional"])
+    col_responsable = find_col(df, ["Responsable Nombre", "Responsable"])
+    col_fecha_resp = find_col(df, ["Fecha Asignación"])
+    col_dias_resp = find_col(df, ["Días Responsable", "Dias Responsable"])
+    col_prerad = find_col(df, ["SIDCAR # Pre-Rad.", "# Pre-Rad.", "Pre-Rad."])
+    col_estado = find_col(df, ["Estado"])
+    col_radicado = find_col(df, ["Radicado"])
+    col_remite = find_col(df, ["Remite Nombre", "Remite"])
+    col_fecha_remite = find_col(df, ["Fecha Asignación_1", "Fecha Asignación 1"])
+    col_dias_remite = find_col(df, ["Días Responsable_1", "Dias Responsable_1"])
+    col_comentarios = find_col(df, ["Comentarios"])
+    col_etapa = find_col(df, ["Etapa"])
+    col_actividad = find_col(df, ["Actividad"])
+
+    faltantes = {"expediente": col_exp, "responsable": col_responsable}
+    faltan = [k for k, v in faltantes.items() if v is None]
+    if faltan:
+        raise KeyError(f"❌ En ACTIVIDADES ACTUALES faltan columnas críticas para Grupo B: {faltan}. Columnas: {list(df.columns)}")
+
+    abogados_norm = self._ga_lista_norm(abogados)
+
+    df["abogado_responsable"] = df[col_responsable].astype(str).apply(self._ga_norm_persona)
+    df["abogado_remite"] = df[col_remite].astype(str).apply(self._ga_norm_persona) if col_remite else ""
+
+    df["es_abogado_responsable"] = df["abogado_responsable"].isin(abogados_norm)
+    df["es_abogado_remite"] = df["abogado_remite"].isin(abogados_norm)
+
+    df = df[df["es_abogado_responsable"] | df["es_abogado_remite"]].copy()
+
+    def abogado_foco(row):
+        if row["es_abogado_responsable"]:
+            return row["abogado_responsable"]
+        if row["es_abogado_remite"]:
+            return row["abogado_remite"]
+        return ""
+
+    df["abogado"] = df.apply(abogado_foco, axis=1)
+    df["expediente"] = df[col_exp].apply(self._ga_extraer_expediente_general)
+    df["tipo_tramite_macro"] = df[col_tipo].apply(self._ga_clasificar_tipo_tramite) if col_tipo else "No identificado"
+    df["regional"] = df[col_regional].astype(str).str.strip() if col_regional else ""
+    df["preradicado_actividad"] = df[col_prerad].astype(str).str.strip() if col_prerad else ""
+    df["estado_actividad"] = df[col_estado].astype(str).str.strip() if col_estado else ""
+    df["radicado_actividad"] = df[col_radicado].astype(str).str.strip() if col_radicado else ""
+    df["revisor_a_cargo"] = df[col_remite].astype(str).str.strip() if col_remite else ""
+    df["fecha_asignacion_abogado"] = pd.to_datetime(df[col_fecha_resp], errors="coerce") if col_fecha_resp else pd.NaT
+    df["dias_abogado"] = pd.to_numeric(df[col_dias_resp], errors="coerce") if col_dias_resp else pd.NA
+    df["fecha_asignacion_revisor"] = pd.to_datetime(df[col_fecha_remite], errors="coerce") if col_fecha_remite else pd.NaT
+    df["dias_revisor"] = pd.to_numeric(df[col_dias_remite], errors="coerce") if col_dias_remite else pd.NA
+    df["comentarios"] = df[col_comentarios].astype(str).str.strip() if col_comentarios else ""
+    df["etapa"] = df[col_etapa].astype(str).str.strip() if col_etapa else ""
+    df["actividad"] = df[col_actividad].astype(str).str.strip() if col_actividad else ""
+
+    df["estado_detalle"] = df.apply(
+        lambda r: self._ga_estado_detalle(
+            estado=r.get("estado_actividad", ""),
+            comentarios=r.get("comentarios", ""),
+            remite_es_abogado=bool(r.get("es_abogado_remite", False))
+        ),
+        axis=1,
+    )
+
+    # Si no tiene preradicado aún, se considera sin iniciar en este flujo
+    df.loc[df["preradicado_actividad"].astype(str).str.strip().eq(""), "estado_detalle"] = "Sin iniciar"
+
+    df["tiene_radicado"] = ~df["radicado_actividad"].astype(str).str.strip().isin(["", "nan", "None"])
+
+    # Último registro operativo por expediente y abogado
+    cols_keep = [
+        "expediente", "abogado", "tipo_tramite_macro", "regional",
+        "preradicado_actividad", "estado_actividad", "radicado_actividad",
+        "revisor_a_cargo", "fecha_asignacion_abogado", "dias_abogado",
+        "fecha_asignacion_revisor", "dias_revisor", "comentarios",
+        "etapa", "actividad", "estado_detalle", "tiene_radicado"
+    ]
+    df = df[cols_keep].copy()
+    df = df[df["expediente"].astype(str).str.strip() != ""].copy()
+    df = df.sort_values(
+        ["abogado", "expediente", "fecha_asignacion_abogado", "fecha_asignacion_revisor"],
+        ascending=[True, True, False, False]
+    )
+    df = df.drop_duplicates(subset=["expediente", "abogado"], keep="first").reset_index(drop=True)
+    return df
+
+
+def _ga_construir_hoja_1(self, df_radicados: pd.DataFrame, abogados: list) -> pd.DataFrame:
+    return self._ga_preparar_radicados_grupo_a(df_radicados=df_radicados, abogados=abogados)
+
+
+def _ga_construir_hoja_2(self, df_actividades: pd.DataFrame, df_preradicados: pd.DataFrame, abogados: list) -> pd.DataFrame:
+    act = self._ga_preparar_actividades_actuales_base(df_actividades=df_actividades, abogados=abogados)
+    pre = self._ga_preparar_preradicados_base(df_preradicados=df_preradicados, abogados=abogados)
+
+    df = act.merge(
+        pre,
+        on=["expediente", "abogado"],
+        how="outer",
+        suffixes=("_act", "_pre")
+    )
+
+    # Unificación de campos
+    df["tipo_tramite_macro"] = df["tipo_tramite_macro"].fillna("No identificado")
+    df["regional"] = df["regional"].fillna("")
+    df["revisor_a_cargo"] = df["revisor_a_cargo"].fillna("")
+    df["tiene_radicado"] = df["tiene_radicado"].fillna(False)
+    df["tiene_preradicado"] = df["tiene_preradicado"].fillna(False)
+    df["subgrupo"] = df["subgrupo"].fillna("gestion")
+    df["preradicado"] = df["preradicado"].fillna(df.get("preradicado_actividad", ""))
+    if "preradicado_actividad" in df.columns:
+        df["preradicado"] = df["preradicado"].astype(str)
+        mask_p = df["preradicado"].isin(["", "nan", "None"])
+        df.loc[mask_p, "preradicado"] = df.loc[mask_p, "preradicado_actividad"].astype(str)
+
+    # Estado operativo
+    df["estado_detalle"] = df["estado_detalle"].fillna("")
+    mask_sin = df["estado_detalle"].eq("")
+    df.loc[mask_sin & (~df["tiene_preradicado"]), "estado_detalle"] = "Sin iniciar"
+    df.loc[mask_sin & (df["tiene_preradicado"]), "estado_detalle"] = "Iniciado por abogado"
+
+    # Si el preradicado trae estados más claros, ajustar
+    estado_pre_texto = df.get("estado_preradicado", pd.Series("", index=df.index)).astype(str).str.lower()
+    df.loc[estado_pre_texto.str.contains("revision|revisión", na=False), "estado_detalle"] = "Enviado para revisión abogado"
+    df.loc[estado_pre_texto.str.contains("aprob", na=False), "estado_detalle"] = "Aprobado por el revisor"
+    df.loc[estado_pre_texto.str.contains("devuelto", na=False), "estado_detalle"] = "Devuelto por el revisor"
+
+    # Calcular días de control: prioriza días abogado; si no existe usa fecha asignación
+    hoy = pd.Timestamp.today().normalize()
+    df["dias_control"] = df["dias_abogado"]
+
+    if "fecha_asignacion_abogado" in df.columns:
+        mask_dias = df["dias_control"].isna() & pd.to_datetime(df["fecha_asignacion_abogado"], errors="coerce").notna()
+        fechas = pd.to_datetime(df.loc[mask_dias, "fecha_asignacion_abogado"], errors="coerce")
+        df.loc[mask_dias, "dias_control"] = (hoy - fechas.dt.normalize()).dt.days
+
+    df["estado_vencimiento"] = df["dias_control"].apply(self._ga_vencimiento)
+
+    # Dummies solicitadas
+    mapa_dummies = {
+        "Sin iniciar": "d_sin_iniciar",
+        "Iniciado por abogado": "d_iniciado_por_abogado",
+        "Enviado para revisión abogado": "d_enviado_para_revision_abogado",
+        "Devuelto por el revisor": "d_devuelto_por_el_revisor",
+        "Aprobado por el revisor": "d_aprobado_por_el_revisor",
+        "Devuelto por el director": "d_devuelto_por_el_director",
+    }
+    for estado, col in mapa_dummies.items():
+        df[col] = (df["estado_detalle"].eq(estado)).astype(int)
+
+    salida = df[[
+        "abogado",
+        "expediente",
+        "regional",
+        "tipo_tramite_macro",
+        "subgrupo",
+        "preradicado",
+        "tiene_preradicado",
+        "tiene_radicado",
+        "estado_detalle",
+        "dias_control",
+        "estado_vencimiento",
+        "revisor_a_cargo",
+        "fecha_asignacion_abogado",
+        "fecha_asignacion_revisor",
+        "dias_revisor",
+        "estado_actividad",
+        "estado_preradicado",
+        "comentarios",
+        "etapa",
+        "actividad",
+        "d_sin_iniciar",
+        "d_iniciado_por_abogado",
+        "d_enviado_para_revision_abogado",
+        "d_devuelto_por_el_revisor",
+        "d_aprobado_por_el_revisor",
+        "d_devuelto_por_el_director",
+    ]].copy()
+
+    salida = salida.sort_values(["abogado", "estado_vencimiento", "estado_detalle", "expediente"]).reset_index(drop=True)
+    return salida
+
+
+def _ga_construir_hoja_3(self, hoja1: pd.DataFrame, hoja2: pd.DataFrame) -> pd.DataFrame:
+    h1 = hoja1.copy()
+    h2 = hoja2.copy()
+
+    r1 = (
+        h1.groupby(["abogado", "tipo_tramite_macro", "subgrupo"], dropna=False)
+        .agg(
+            total_radicados=("expediente", "nunique"),
+            registros=("expediente", "count"),
+        )
+        .reset_index()
+    )
+    r1["bloque"] = "Grupo A - Radicados"
+
+    r2 = (
+        h2.groupby(["abogado", "tipo_tramite_macro", "estado_detalle", "estado_vencimiento"], dropna=False)
+        .agg(
+            total_expedientes=("expediente", "nunique"),
+            registros=("expediente", "count"),
+        )
+        .reset_index()
+    )
+    r2["bloque"] = "Grupo B - Seguimiento"
+
+    cols_r1 = ["bloque", "abogado", "tipo_tramite_macro", "subgrupo", "total_radicados", "registros"]
+    cols_r2 = ["bloque", "abogado", "tipo_tramite_macro", "estado_detalle", "estado_vencimiento", "total_expedientes", "registros"]
+
+    # Homologar columnas para exportar juntas
+    r1 = r1.rename(columns={"subgrupo": "categoria_1", "total_radicados": "total"})
+    r2 = r2.rename(columns={"estado_detalle": "categoria_1", "estado_vencimiento": "categoria_2", "total_expedientes": "total"})
+
+    r1["categoria_2"] = ""
+    r2["categoria_2"] = r2["categoria_2"].fillna("")
+
+    resumen = pd.concat([
+        r1[["bloque", "abogado", "tipo_tramite_macro", "categoria_1", "categoria_2", "total", "registros"]],
+        r2[["bloque", "abogado", "tipo_tramite_macro", "categoria_1", "categoria_2", "total", "registros"]],
+    ], ignore_index=True)
+
+    return resumen.sort_values(["bloque", "abogado", "tipo_tramite_macro", "categoria_1", "categoria_2"]).reset_index(drop=True)
+
+
+def _ga_exportar_seguimiento_sidcar_sae_grupo_a(
+    self,
+    df_radicados: pd.DataFrame,
+    df_actividades: pd.DataFrame,
+    df_preradicados: pd.DataFrame,
+    abogados: list,
+    carpeta_salida: str = "seguimiento_sae_sidcar_grupo_A",
+    nombre_archivo: str = "seguimiento_sae_sidcar_grupo_A.xlsx",
+) -> str:
+    self.asegurar_carpeta(carpeta_salida)
+    hoja1 = self._ga_construir_hoja_1(df_radicados=df_radicados, abogados=abogados)
+    hoja2 = self._ga_construir_hoja_2(df_actividades=df_actividades, df_preradicados=df_preradicados, abogados=abogados)
+    hoja3 = self._ga_construir_hoja_3(hoja1=hoja1, hoja2=hoja2)
+
+    ruta = os.path.join(carpeta_salida, nombre_archivo)
+    with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
+        hoja1.to_excel(writer, sheet_name="hoja_1_grupo_a", index=False)
+        hoja2.to_excel(writer, sheet_name="hoja_2_seguimiento", index=False)
+        hoja3.to_excel(writer, sheet_name="hoja_3_resumen", index=False)
+
+    print(f"✅ Archivo exportado en: {ruta}")
+    return ruta
+
+
+# Asignación explícita a Utils
+Utils._ga_norm_persona = _ga_norm_persona
+Utils._ga_lista_norm = _ga_lista_norm
+Utils._ga_extraer_expediente_general = _ga_extraer_expediente_general
+Utils._ga_clasificar_subgrupo_asunto = _ga_clasificar_subgrupo_asunto
+Utils._ga_clasificar_tipo_tramite = _ga_clasificar_tipo_tramite
+Utils._ga_estado_detalle = _ga_estado_detalle
+Utils._ga_estado_macro = _ga_estado_macro
+Utils._ga_vencimiento = _ga_vencimiento
+Utils._ga_preparar_radicados_grupo_a = _ga_preparar_radicados_grupo_a
+Utils._ga_preparar_preradicados_base = _ga_preparar_preradicados_base
+Utils._ga_preparar_actividades_actuales_base = _ga_preparar_actividades_actuales_base
+Utils._ga_construir_hoja_1 = _ga_construir_hoja_1
+Utils._ga_construir_hoja_2 = _ga_construir_hoja_2
+Utils._ga_construir_hoja_3 = _ga_construir_hoja_3
+Utils.exportar_seguimiento_sidcar_sae_grupo_a = _ga_exportar_seguimiento_sidcar_sae_grupo_a
